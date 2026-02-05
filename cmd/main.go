@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"restaurant-system/internal/config"
+	"restaurant-system/internal/constants"
 	"restaurant-system/internal/database"
 	"restaurant-system/internal/features/kitchen"
 	"restaurant-system/internal/features/notification"
@@ -23,179 +24,232 @@ import (
 )
 
 func main() {
+	// Parse command line flags
 	mode := flag.String("mode", "", "Service mode")
-	port := flag.Int("port", 3000, "HTTP port")
+	port := flag.Int("port", constants.DefaultOrderServicePort, "HTTP port")
 	workerName := flag.String("worker-name", "", "Worker name")
-	orderTypes := flag.String("order-types", "", "Order types")
-	prefetch := flag.Int("prefetch", 1, "Prefetch count")
+	orderTypes := flag.String("order-types", "", "Order types (comma-separated)")
+	prefetch := flag.Int("prefetch", constants.DefaultPrefetchCount, "Prefetch count")
+	heartbeatInterval := flag.Int("heartbeat-interval", int(constants.DefaultHeartbeatInterval.Seconds()), "Heartbeat interval in seconds")
+	configPath := flag.String("config", "config.yaml", "Config file path")
 
 	flag.Parse()
 
+	// Validate required flags
 	if *mode == "" {
 		fmt.Println("Error: --mode is required")
 		os.Exit(1)
 	}
 
+	// Initialize logger
 	logger.Init(*mode)
+	logger.LogInfo("startup", fmt.Sprintf("Starting %s", *mode), "startup")
 
-	cfg, err := config.LoadConfig("config.yaml")
+	// Load configuration
+	cfg, err := config.LoadConfig(*configPath)
 	if err != nil {
-		logger.LogError("startup", "Failed to load config", err, "")
+		logger.LogError("startup", "Failed to load config", err, "startup")
 		os.Exit(1)
 	}
 
+	// Connect to database
 	dbPool, err := database.Connect(context.Background(), cfg.DBConnectionURL())
 	if err != nil {
-		logger.LogError("startup", "DB connection failed", err, "")
+		logger.LogError("startup", "DB connection failed", err, "startup")
 		os.Exit(1)
 	}
 	defer dbPool.Close()
 
+	// Connect to RabbitMQ
 	rmqClient, err := rabbitmq.Connect(cfg.RabbitMQURL())
 	if err != nil {
-		logger.LogError("startup", "RabbitMQ connection failed", err, "")
+		logger.LogError("startup", "RabbitMQ connection failed", err, "startup")
 		os.Exit(1)
 	}
 	defer rmqClient.Close()
 
+	// Start appropriate service based on mode
 	switch *mode {
-	case "order-service":
+	case constants.ServiceOrderService:
 		runOrderService(dbPool, rmqClient, *port)
-	case "kitchen-worker":
+	case constants.ServiceKitchenWorker:
 		if *workerName == "" {
-			logger.LogError("startup", "--worker-name is required", nil, "")
+			logger.LogError("startup", "--worker-name is required for kitchen-worker mode",
+				fmt.Errorf("missing required flag"), "startup")
 			os.Exit(1)
 		}
-		runKitchenWorker(dbPool, rmqClient, *workerName, *orderTypes, *prefetch)
-	case "tracking-service":
+		runKitchenWorker(dbPool, rmqClient, *workerName, *orderTypes, *prefetch, *heartbeatInterval)
+	case constants.ServiceTrackingService:
 		runTrackingService(dbPool, *port)
-	case "notification-subscriber":
+	case constants.ServiceNotificationSubscriber:
 		runNotificationSubscriber(rmqClient)
 	default:
-		logger.LogError("startup", "Unknown mode: "+*mode, nil, "")
+		logger.LogError("startup", "Unknown mode: "+*mode, fmt.Errorf("invalid mode"), "startup")
 		os.Exit(1)
 	}
 }
 
+// runOrderService starts the order service
 func runOrderService(db *pgxpool.Pool, rmq *rabbitmq.Client, port int) {
-	ch, err := rmq.CreateChannel()
+	ch, err := rmq.CreateChannelWithRetry(constants.MaxRetryAttempts)
 	if err != nil {
-		logger.LogError("startup", "Failed to create channel", err, "")
+		logger.LogError("startup", "Failed to create channel", err, "startup")
 		os.Exit(1)
 	}
 	defer ch.Close()
 
-	err = ch.ExchangeDeclare("orders_topic", "topic", true, false, false, false, nil)
-	if err != nil {
-		logger.LogError("startup", "Failed to declare exchange", err, "")
+	// Declare orders exchange
+	if err := rabbitmq.DeclareExchange(ch, constants.ExchangeOrdersTopic, "topic"); err != nil {
+		logger.LogError("startup", "Failed to declare exchange", err, "startup")
 		os.Exit(1)
 	}
 
-	svc := order.NewService(db, ch)
-	handler := order.NewHandler(svc)
+	logger.LogInfo("rabbitmq_connected", 
+		fmt.Sprintf("Connected to RabbitMQ exchange '%s'", constants.ExchangeOrdersTopic), "startup")
 
+	// Create service and handler
+	svc := order.NewService(db, ch)
+	handler := order.NewHandler(svc, db)
+
+	// Setup HTTP routes
 	mux := http.NewServeMux()
 	mux.HandleFunc("/orders", handler.CreateOrder)
+	mux.HandleFunc("/health", handler.HealthCheck)
 
-	startHTTPServer(port, mux)
+	startHTTPServer(port, mux, constants.ServiceOrderService)
 }
 
-func runKitchenWorker(db *pgxpool.Pool, rmq *rabbitmq.Client, name, types string, prefetch int) {
-	ch, err := rmq.CreateChannel()
+// runKitchenWorker starts a kitchen worker
+func runKitchenWorker(db *pgxpool.Pool, rmq *rabbitmq.Client, name, types string, prefetch int, heartbeatInterval int) {
+	ch, err := rmq.CreateChannelWithRetry(constants.MaxRetryAttempts)
 	if err != nil {
-		logger.LogError("startup", "Failed to create channel", err, "")
+		logger.LogError("startup", "Failed to create channel", err, "startup")
 		os.Exit(1)
 	}
 	defer ch.Close()
 
-	worker := kitchen.NewWorker(db, ch, name, types)
+	// Declare orders exchange
+	if err := rabbitmq.DeclareExchange(ch, constants.ExchangeOrdersTopic, "topic"); err != nil {
+		logger.LogError("startup", "Failed to declare orders_topic exchange", err, "startup")
+		os.Exit(1)
+	}
 
+	// Create worker
+	worker := kitchen.NewWorker(db, ch, name, types, heartbeatInterval)
+
+	// Setup graceful shutdown
 	ctx, cancel := context.WithCancel(context.Background())
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 
 	go func() {
-		<-sigChan
-		logger.LogInfo("shutdown", "Shutdown signal received", "")
+		sig := <-sigChan
+		logger.LogInfo("shutdown", fmt.Sprintf("Received signal: %v", sig), "shutdown")
 		cancel()
 	}()
 
+	// Run worker
 	if err := worker.Run(ctx, prefetch); err != nil {
-		logger.LogError("worker_error", "Worker stopped with error", err, "")
+		logger.LogError("worker_error", "Worker stopped with error", err, "shutdown")
 		os.Exit(1)
 	}
+
+	logger.LogInfo("shutdown", "Worker stopped gracefully", "shutdown")
 }
 
+// runTrackingService starts the tracking service
 func runTrackingService(db *pgxpool.Pool, port int) {
 	svc := tracking.NewService(db)
-	handler := tracking.NewHandler(svc)
+	handler := tracking.NewHandler(svc, db)
 
+	// Setup HTTP routes
 	mux := http.NewServeMux()
-	
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		if strings.HasSuffix(r.URL.Path, "/status") && strings.HasPrefix(r.URL.Path, "/orders/") {
+
+	mux.HandleFunc("/orders/", func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/status") {
 			handler.GetOrderStatus(w, r)
 			return
 		}
-		if strings.HasSuffix(r.URL.Path, "/history") && strings.HasPrefix(r.URL.Path, "/orders/") {
+		if strings.HasSuffix(r.URL.Path, "/history") {
 			handler.GetOrderHistory(w, r)
-			return
-		}
-		if r.URL.Path == "/workers/status" {
-			handler.GetWorkersStatus(w, r)
 			return
 		}
 		http.NotFound(w, r)
 	})
 
-	startHTTPServer(port, mux)
+	mux.HandleFunc("/workers/status", handler.GetWorkersStatus)
+	mux.HandleFunc("/health", handler.HealthCheck)
+
+	startHTTPServer(port, mux, constants.ServiceTrackingService)
 }
 
+// runNotificationSubscriber starts the notification subscriber
 func runNotificationSubscriber(rmq *rabbitmq.Client) {
-	ch, err := rmq.CreateChannel()
+	ch, err := rmq.CreateChannelWithRetry(constants.MaxRetryAttempts)
 	if err != nil {
-		logger.LogError("startup", "Failed to create channel", err, "")
+		logger.LogError("startup", "Failed to create channel", err, "startup")
 		os.Exit(1)
 	}
 	defer ch.Close()
 
 	sub := notification.NewSubscriber(ch)
 
+	// Setup graceful shutdown
 	ctx, cancel := context.WithCancel(context.Background())
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 
 	go func() {
-		<-sigChan
-		logger.LogInfo("shutdown", "Shutdown signal received", "")
+		sig := <-sigChan
+		logger.LogInfo("shutdown", fmt.Sprintf("Received signal: %v", sig), "shutdown")
 		cancel()
 	}()
 
+	// Run subscriber
 	if err := sub.Run(ctx); err != nil {
-		logger.LogError("subscriber_error", "Subscriber stopped with error", err, "")
+		logger.LogError("subscriber_error", "Subscriber stopped with error", err, "shutdown")
 		os.Exit(1)
 	}
+
+	logger.LogInfo("shutdown", "Subscriber stopped gracefully", "shutdown")
 }
 
-func startHTTPServer(port int, handler http.Handler) {
+// startHTTPServer starts an HTTP server with graceful shutdown
+func startHTTPServer(port int, handler http.Handler, serviceName string) {
 	server := &http.Server{
-		Addr:    fmt.Sprintf(":%d", port),
-		Handler: handler,
+		Addr:              fmt.Sprintf(":%d", port),
+		Handler:           handler,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      15 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		ReadHeaderTimeout: 5 * time.Second,
 	}
 
+	// Start server in background
 	go func() {
-		logger.LogInfo("service_started", fmt.Sprintf("Service started on port %d", port), "")
+		logger.LogInfo("service_started",
+			fmt.Sprintf("%s started on port %d", serviceName, port), "startup",
+			"port", port,
+			"service", serviceName)
+
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			logger.LogError("shutdown", "Server error", err, "")
+			logger.LogError("server_error", "HTTP server error", err, "shutdown")
 		}
 	}()
 
+	// Wait for shutdown signal
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 	<-stop
 
-	logger.LogInfo("shutdown", "Shutting down gracefully...", "")
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	// Graceful shutdown
+	logger.LogInfo("graceful_shutdown", "Shutting down HTTP server gracefully...", "shutdown")
+	ctx, cancel := context.WithTimeout(context.Background(), constants.ContextTimeoutShutdown)
 	defer cancel()
-	server.Shutdown(ctx)
+
+	if err := server.Shutdown(ctx); err != nil {
+		logger.LogError("shutdown_error", "Server forced to shutdown", err, "shutdown")
+	} else {
+		logger.LogInfo("shutdown", "Server stopped gracefully", "shutdown")
+	}
 }

@@ -1,4 +1,4 @@
--- 1. Таблица заказов
+-- Orders table
 CREATE TABLE IF NOT EXISTS orders (
     id SERIAL PRIMARY KEY,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -15,28 +15,37 @@ CREATE TABLE IF NOT EXISTS orders (
     completed_at TIMESTAMPTZ
 );
 
--- 2. Позиции заказа
+CREATE INDEX idx_orders_number ON orders(number);
+CREATE INDEX idx_orders_status ON orders(status);
+CREATE INDEX idx_orders_created_at ON orders(created_at);
+
+-- Order items table
 CREATE TABLE IF NOT EXISTS order_items (
     id SERIAL PRIMARY KEY,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    order_id INTEGER REFERENCES orders(id),
+    order_id INTEGER REFERENCES orders(id) ON DELETE CASCADE,
     name TEXT NOT NULL,
     quantity INTEGER NOT NULL,
     price DECIMAL(8,2) NOT NULL
 );
 
--- 3. Лог смены статусов (история)
+CREATE INDEX idx_order_items_order_id ON order_items(order_id);
+
+-- Order status log table
 CREATE TABLE IF NOT EXISTS order_status_log (
     id SERIAL PRIMARY KEY,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    order_id INTEGER REFERENCES orders(id),
+    order_id INTEGER REFERENCES orders(id) ON DELETE CASCADE,
     status TEXT,
     changed_by TEXT,
     changed_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
     notes TEXT
 );
 
--- 4. Воркеры (кухня)
+CREATE INDEX idx_order_status_log_order_id ON order_status_log(order_id);
+CREATE INDEX idx_order_status_log_changed_at ON order_status_log(changed_at);
+
+-- Workers table
 CREATE TABLE IF NOT EXISTS workers (
     id SERIAL PRIMARY KEY,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -47,9 +56,13 @@ CREATE TABLE IF NOT EXISTS workers (
     orders_processed INTEGER DEFAULT 0
 );
 
--- 5. Техническая таблица для генерации номеров заказов (Reset Daily Logic)
--- Нужна, чтобы безопасно генерировать номер 001, 002 каждый новый день.
+CREATE INDEX idx_workers_name ON workers(name);
+CREATE INDEX idx_workers_status ON workers(status);
+
+-- Daily order counters table
 CREATE TABLE IF NOT EXISTS daily_order_counters (
     date DATE PRIMARY KEY,
     counter INTEGER DEFAULT 0
 );
+
+CREATE INDEX idx_daily_order_counters_date ON daily_order_counters(date);

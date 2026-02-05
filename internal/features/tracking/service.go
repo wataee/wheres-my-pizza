@@ -2,6 +2,7 @@ package tracking
 
 import (
 	"context"
+	"restaurant-system/internal/constants"
 	"restaurant-system/internal/models"
 	"time"
 
@@ -9,15 +10,21 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+// Service handles order tracking operations
 type Service struct {
 	DB *pgxpool.Pool
 }
 
+// NewService creates a new tracking service
 func NewService(db *pgxpool.Pool) *Service {
 	return &Service{DB: db}
 }
 
+// GetOrderStatus retrieves the current status of an order
 func (s *Service) GetOrderStatus(ctx context.Context, orderNum string) (*models.OrderStatusResponse, error) {
+	ctx, cancel := context.WithTimeout(ctx, constants.ContextTimeoutDB)
+	defer cancel()
+
 	var r models.OrderStatusResponse
 	var completedAt *time.Time
 	var processedBy *string
@@ -38,7 +45,8 @@ func (s *Service) GetOrderStatus(ctx context.Context, orderNum string) (*models.
 		r.ProcessedBy = *processedBy
 	}
 
-	if r.CurrentStatus == "cooking" {
+	// Calculate estimated completion
+	if r.CurrentStatus == constants.OrderStatusCooking {
 		r.EstimatedCompletion = r.UpdatedAt.Add(10 * time.Second)
 	} else if completedAt != nil {
 		r.EstimatedCompletion = *completedAt
@@ -47,7 +55,11 @@ func (s *Service) GetOrderStatus(ctx context.Context, orderNum string) (*models.
 	return &r, nil
 }
 
+// GetOrderHistory retrieves the full history of an order
 func (s *Service) GetOrderHistory(ctx context.Context, orderNum string) ([]models.OrderHistoryEntry, error) {
+	ctx, cancel := context.WithTimeout(ctx, constants.ContextTimeoutDB)
+	defer cancel()
+
 	rows, err := s.DB.Query(ctx, `
 		SELECT l.status, l.changed_at, l.changed_by
 		FROM order_status_log l
@@ -72,7 +84,11 @@ func (s *Service) GetOrderHistory(ctx context.Context, orderNum string) ([]model
 	return history, nil
 }
 
+// GetWorkersStatus retrieves the status of all workers
 func (s *Service) GetWorkersStatus(ctx context.Context) ([]models.WorkerStatus, error) {
+	ctx, cancel := context.WithTimeout(ctx, constants.ContextTimeoutDB)
+	defer cancel()
+
 	rows, err := s.DB.Query(ctx, `
 		SELECT name, status, orders_processed, last_seen
 		FROM workers
@@ -90,9 +106,11 @@ func (s *Service) GetWorkersStatus(ctx context.Context) ([]models.WorkerStatus, 
 			return nil, err
 		}
 
+		// Check if worker is offline based on last_seen
 		if time.Since(w.LastSeen) > 60*time.Second {
-			w.Status = "offline"
+			w.Status = constants.WorkerStatusOffline
 		}
+		
 		workers = append(workers, w)
 	}
 
