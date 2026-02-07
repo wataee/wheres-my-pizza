@@ -1,12 +1,12 @@
 database:
-  host: postgres  # Имя сервиса из docker-compose
+  host: postgres
   port: 5432
   user: restaurant_user
   password: restaurant_pass
   database: restaurant_db
 
 rabbitmq:
-  host: rabbitmq  # Имя сервиса из docker-compose
+  host: rabbitmq
   port: 5672
   user: guest
   password: guest
