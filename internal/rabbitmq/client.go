@@ -15,6 +15,9 @@ const (
 	ReconnectDelay    = 5 * time.Second
 	MaxReconnectDelay = 60 * time.Second
 	ReconnectAttempts = 0 // 0 means infinite
+	
+	// Startup settings
+	MaxStartupRetries = 15 // Пытаться подключиться 15 раз при старте
 )
 
 // Client represents a RabbitMQ client with auto-reconnection
@@ -43,9 +46,33 @@ func Connect(url string) (*Client, error) {
 		cancel:      cancel,
 	}
 
-	if err := client.connect(); err != nil {
+	// Retry logic for initial connection
+	connected := false
+	backoff := 2 * time.Second
+
+	for i := 1; i <= MaxStartupRetries; i++ {
+		if err := client.connect(); err != nil {
+			logger.LogInfo("rabbitmq_startup_retry", 
+				fmt.Sprintf("Failed to connect to RabbitMQ (attempt %d/%d), retrying in %v...", i, MaxStartupRetries, backoff), 
+				"startup")
+			
+			time.Sleep(backoff)
+			
+			// Exponential backoff capped at 10s
+			backoff *= 2
+			if backoff > 10*time.Second {
+				backoff = 10 * time.Second
+			}
+			continue
+		}
+		
+		connected = true
+		break
+	}
+
+	if !connected {
 		cancel()
-		return nil, err
+		return nil, fmt.Errorf("failed to connect to rabbitmq after %d attempts", MaxStartupRetries)
 	}
 
 	// Start connection monitor
