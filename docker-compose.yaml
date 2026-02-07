@@ -1,4 +1,5 @@
 services:
+  # --- Инфраструктура (База и RabbitMQ) ---
   postgres:
     image: postgres:15-alpine
     environment:
@@ -7,8 +8,6 @@ services:
       POSTGRES_DB: restaurant_db
     ports:
       - "5432:5432"
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U restaurant_user -d restaurant_db"]
       interval: 10s
@@ -23,14 +22,50 @@ services:
     environment:
       RABBITMQ_DEFAULT_USER: guest
       RABBITMQ_DEFAULT_PASS: guest
-    volumes:
-      - rabbitmq_data:/var/lib/rabbitmq
     healthcheck:
       test: ["CMD", "rabbitmq-diagnostics", "ping"]
       interval: 10s
       timeout: 5s
       retries: 5
 
-volumes:
-  postgres_data:
-  rabbitmq_data:
+  # --- Твои Go сервисы ---
+  
+  # Сервис заказов (API)
+  order-service:
+    build: .  # Соберет образ из текущей папки (используя Dockerfile)
+    command: ["-mode=order-service", "-port=3000"] # Аргументы запуска
+    ports:
+      - "3000:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
+  # Кухонный работник (Worker)
+  kitchen-worker:
+    build: .
+    command: ["-mode=kitchen-worker", "-worker-name=chef_mario", "-order-types=pizza,pasta"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
+  # Сервис трекинга (API)
+  tracking-service:
+    build: .
+    command: ["-mode=tracking-service", "-port=3002"]
+    ports:
+      - "3002:3002"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # Подписчик уведомлений
+  notification-service:
+    build: .
+    command: ["-mode=notification-subscriber"]
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
