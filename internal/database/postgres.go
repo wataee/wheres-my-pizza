@@ -241,7 +241,6 @@ func RunInTxWithRetry(ctx context.Context, pool *pgxpool.Pool, fn func(pgx.Tx) e
 func isRetryableError(err error) bool {
     var pgErr *pgconn.PgError
     
-    // Используем errors.As для безопасного извлечения ошибки PostgreSQL
     if !errors.As(err, &pgErr) {
         return false
     }
